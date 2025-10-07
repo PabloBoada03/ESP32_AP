@@ -1,307 +1,201 @@
-/*
-  wifi_provisioning.ino (versión con opción web y serial para borrar credenciales)
-  - Timeout de 15s en conexión STA
-  - Permite borrar credenciales desde Serial ('r' o 'R') y desde web (/api/reset)
-*/
-
 #include <WiFi.h>
 #include <WebServer.h>
-#include <DNSServer.h>
-#include <Preferences.h>
+#include <SPIFFS.h>
 #include <ArduinoJson.h>
 
-#define AP_SSID      "ESP32-Provision"
-#define AP_PASSWORD  "provision123"
-#define AP_IP_FIRST  192
-#define AP_IP_SECOND 168
-#define AP_IP_THIRD  4
-#define AP_IP_FOURTH 1
+#define RESET_BUTTON_PIN 0  // Botón conectado al pin GPIO0 (ajústalo si usas otro)
 
-Preferences prefs;
-WebServer server(80);
-DNSServer dnsServer;
-
-IPAddress apIP(AP_IP_FIRST, AP_IP_SECOND, AP_IP_THIRD, AP_IP_FOURTH);
-
-bool runningInAP = false;
-unsigned long lastConnectAttempt = 0;
-
-void startAP();
-void startSTAWeb();
+// --- Prototipos ---
+void startAccessPoint();
 void handleRoot();
 void handleSave();
-void handleApiCredentials();
-void handleApiStatus();
-void handleApiReset();
-void handleScan();
-void handleNotFound();
-void saveCredentials(const String &ssid, const String &pass);
+void handleReset();
+void loadCredentials();
+void saveCredentials(const String& ssid, const String& password);
 void clearCredentials();
-bool hasSavedCredentials();
-String getSavedSSID();
-String getSavedPASS();
-void tryConnectSaved();
+bool connectToWiFi();
 
+WebServer server(80);
+String ssid = "";
+String password = "";
+
+// ===================================================
+// SETUP PRINCIPAL
+// ===================================================
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
-  prefs.begin("wifi", false);
-
-  Serial.println();
-  Serial.println("=== ESP32 WiFi Provisioning ===");
-  Serial.println("Comandos disponibles:");
-  Serial.println("  r  →  borrar credenciales y reiniciar");
-  Serial.println();
-
-  if (hasSavedCredentials()) {
-    Serial.println("Credenciales guardadas encontradas. Intentando conectar...");
-    tryConnectSaved();
-  } else {
-    Serial.println("No hay credenciales guardadas.");
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Arrancando en modo AP (provisioning)...");
-    startAP();
-  }
-}
-
-void loop() {
-  // --- Leer comandos por Serial ---
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c == 'r' || c == 'R') {
-      Serial.println("⚠️ Borrando credenciales guardadas...");
-      clearCredentials();
-      delay(800);
-      ESP.restart();
-    }
-  }
-
-  if (runningInAP) {
-    dnsServer.processNextRequest();
-    server.handleClient();
-  } else {
-    server.handleClient();
-    if (WiFi.status() != WL_CONNECTED) {
-      unsigned long now = millis();
-      if (now - lastConnectAttempt > 10000) {
-        Serial.println("Conexión perdida. Reintentando...");
-        lastConnectAttempt = now;
-        tryConnectSaved();
-      }
-    }
-    delay(10);
-  }
-}
-
-/* ---------- Start AP ---------- */
-void startAP() {
-  runningInAP = true;
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-
-  dnsServer.start(53, "*", apIP);
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/save", HTTP_POST, handleSave);
-  server.on("/scan", HTTP_GET, handleScan);
-  server.on("/api/credentials", HTTP_POST, handleApiCredentials);
-  server.on("/api/status", HTTP_GET, handleApiStatus);
-  server.on("/api/reset", HTTP_POST, handleApiReset);
-  server.onNotFound(handleNotFound);
-
-  server.begin();
-
-  Serial.print("AP iniciado. SSID: ");
-  Serial.print(AP_SSID);
-  Serial.print("  IP: ");
-  Serial.println(apIP.toString());
-}
-
-/* ---------- Start STA Web ---------- */
-void startSTAWeb() {
-  runningInAP = false;
-  WiFi.mode(WIFI_STA);
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/status", HTTP_GET, handleApiStatus);
-  server.on("/api/reset", HTTP_POST, handleApiReset);
-  server.onNotFound(handleNotFound);
-  server.begin();
-
-  Serial.println("Servidor HTTP iniciado en modo STA.");
-}
-
-/* ---------- Página principal ---------- */
-void handleRoot() {
-  String page = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1' />";
-  page += "<title>ESP32 WiFi Provision</title></head><body style='font-family:sans-serif;text-align:center'>";
-
-  if (runningInAP) {
-    page += "<h2>ESP32 - Provisioning WiFi</h2>";
-    page += "<form action='/save' method='POST'>";
-    page += "SSID: <input name='ssid' id='ssid' required><br>";
-    page += "Password: <input name='password' id='password' type='password'><br><br>";
-    page += "<button type='submit'>Guardar y conectar</button>";
-    page += "</form>";
-    page += "<br><button onclick='scan()'>Listar redes</button>";
-    page += "<ul id='networks'></ul>";
-    page += "<hr><button onclick='resetCreds()' style='background:red;color:white'>🧹 Borrar credenciales</button>";
-    page += "<script>";
-    page += "function scan(){fetch('/scan').then(r=>r.json()).then(rs=>{let ul=document.getElementById('networks');ul.innerHTML='';rs.forEach(n=>{let li=document.createElement('li');let b=document.createElement('button');b.textContent='Usar';b.onclick=()=>{document.getElementById('ssid').value=n.ssid};li.appendChild(document.createTextNode(n.ssid+' (RSSI:'+n.rssi+') '));li.appendChild(b);ul.appendChild(li);});});}";
-    page += "function resetCreds(){fetch('/api/reset',{method:'POST'}).then(()=>{alert('Credenciales borradas. Reiniciando...');});}";
-    page += "</script>";
-  } else {
-    page += "<h2>ESP32 - Estado</h2>";
-    page += "<p>Conectado a SSID: " + WiFi.SSID() + "</p>";
-    page += "<p>IP: " + WiFi.localIP().toString() + "</p>";
-    page += "<form method='POST' action='/api/reset'><button type='submit' style='background:red;color:white'>🧹 Borrar credenciales</button></form>";
-  }
-
-  page += "</body></html>";
-  server.send(200, "text/html", page);
-}
-
-/* ---------- Handlers ---------- */
-void handleSave() {
-  String ssid = server.arg("ssid");
-  String password = server.arg("password");
-  if (ssid.length() == 0) {
-    server.send(400, "application/json", "{\"error\":\"ssid vacío\"}");
+  // Inicializar SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Error montando SPIFFS");
     return;
   }
-  saveCredentials(ssid, password);
-  server.send(200, "application/json", "{\"result\":\"ok\",\"restarting\":true}");
-  delay(800);
-  ESP.restart();
+
+  // Si el botón está presionado al inicio → borrar credenciales
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    Serial.println("Botón de reset presionado. Borrando credenciales...");
+    clearCredentials();
+    delay(1000);
+  }
+
+  // Intentar cargar credenciales guardadas
+  loadCredentials();
+
+  // Si no hay credenciales o conexión fallida, iniciar AP
+  if (ssid == "" || !connectToWiFi()) {
+    startAccessPoint();
+  }
 }
 
-void handleApiCredentials() {
-  String body = server.arg("plain");
-  String ssid = "", password = "";
-  if (body.length() > 0) {
-    StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, body);
-    if (!err) {
-      ssid = doc["ssid"] | "";
-      password = doc["password"] | "";
-    } else {
-      server.send(400, "application/json", "{\"error\":\"JSON inválido\"}");
-      return;
-    }
-  } else {
+// ===================================================
+// LOOP PRINCIPAL
+// ===================================================
+void loop() {
+  server.handleClient();
+}
+
+// ===================================================
+// MODO AP Y PORTAL DE CONFIGURACIÓN
+// ===================================================
+void startAccessPoint() {
+  Serial.println("Iniciando modo Access Point...");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32_Config", "12345678");
+  Serial.println("Red WiFi creada: ESP32_Config");
+  Serial.print("IP del AP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/save", handleSave);
+  server.on("/reset", handleReset);
+  server.begin();
+}
+
+// Página HTML de configuración
+void handleRoot() {
+  String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Configuración WiFi</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body { font-family: Arial; text-align: center; margin-top: 40px; }
+        input { padding: 8px; width: 80%; margin: 6px; }
+        button { padding: 10px 20px; margin: 10px; }
+      </style>
+    </head>
+    <body>
+      <h2>Configuración de WiFi</h2>
+      <form action="/save" method="post">
+        <input type="text" name="ssid" placeholder="SSID" required><br>
+        <input type="password" name="password" placeholder="Contraseña" required><br>
+        <button type="submit">Guardar</button>
+      </form>
+      <hr>
+      <form action="/reset" method="get">
+        <button style="background-color:#ff4d4d; color:white;">🗑️ Borrar credenciales</button>
+      </form>
+    </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+// Guardar credenciales y reiniciar
+void handleSave() {
+  if (server.hasArg("ssid") && server.hasArg("password")) {
     ssid = server.arg("ssid");
     password = server.arg("password");
+    saveCredentials(ssid, password);
+    server.send(200, "text/html", "<h3>Credenciales guardadas. Reiniciando...</h3>");
+    delay(2000);
+    ESP.restart();
+  } else {
+    server.send(400, "text/plain", "Faltan parámetros SSID o password");
   }
+}
 
-  if (ssid.length() == 0) {
-    server.send(400, "application/json", "{\"error\":\"ssid vacío\"}");
+// Borrar credenciales desde la web
+void handleReset() {
+  clearCredentials();
+  server.send(200, "text/html", "<h3>Credenciales borradas. Reiniciando...</h3>");
+  delay(2000);
+  ESP.restart();
+}
+
+// ===================================================
+// MANEJO DE CREDENCIALES EN SPIFFS
+// ===================================================
+void loadCredentials() {
+  File file = SPIFFS.open("/wifi.json", "r");
+  if (!file) {
+    Serial.println("No se encontraron credenciales guardadas");
     return;
   }
-  saveCredentials(ssid, password);
-  server.send(200, "application/json", "{\"result\":\"ok\",\"restarting\":true}");
-  delay(800);
-  ESP.restart();
-}
 
-void handleApiStatus() {
-  DynamicJsonDocument doc(256);
-  doc["connected"] = (WiFi.status() == WL_CONNECTED);
-  if (WiFi.status() == WL_CONNECTED) {
-    doc["ssid"] = WiFi.SSID();
-    doc["ip"] = WiFi.localIP().toString();
-  } else {
-    doc["ap_mode"] = runningInAP;
-    doc["ap_ssid"] = AP_SSID;
-    doc["ap_ip"] = apIP.toString();
+  StaticJsonDocument<128> doc;
+  DeserializationError error = deserializeJson(doc, file);
+  if (error) {
+    Serial.println("Error leyendo JSON");
+    return;
   }
-  String out;
-  serializeJson(doc, out);
-  server.send(200, "application/json", out);
+
+  ssid = doc["ssid"].as<String>();
+  password = doc["password"].as<String>();
+  Serial.println("Credenciales cargadas:");
+  Serial.println("SSID: " + ssid);
+  file.close();
 }
 
-void handleApiReset() {
-  clearCredentials();
-  server.send(200, "application/json", "{\"result\":\"ok\",\"restarting\":true}");
-  delay(800);
-  ESP.restart();
-}
+void saveCredentials(const String& ssid, const String& password) {
+  StaticJsonDocument<128> doc;
+  doc["ssid"] = ssid;
+  doc["password"] = password;
 
-void handleScan() {
-  int16_t n = WiFi.scanNetworks();
-  DynamicJsonDocument doc(2048);
-  JsonArray arr = doc.to<JsonArray>();
-  for (int i = 0; i < n; i++) {
-    JsonObject item = arr.createNestedObject();
-    item["ssid"] = WiFi.SSID(i);
-    item["rssi"] = WiFi.RSSI(i);
-    item["enc"] = WiFi.encryptionType(i);
+  File file = SPIFFS.open("/wifi.json", "w");
+  if (!file) {
+    Serial.println("Error guardando credenciales");
+    return;
   }
-  String out;
-  serializeJson(doc, out);
-  server.send(200, "application/json", out);
-  WiFi.scanDelete();
-}
 
-void handleNotFound() {
-  if (runningInAP) {
-    server.sendHeader("Location", String("http://") + apIP.toString(), true);
-    server.send(302, "text/plain", "");
-  } else {
-    server.send(404, "text/plain", "Not found");
-  }
-}
-
-/* ---------- Utilities ---------- */
-void saveCredentials(const String &ssid, const String &pass) {
-  prefs.putString("ssid", ssid);
-  prefs.putString("pass", pass);
-  Serial.println("Credenciales guardadas en NVS.");
+  serializeJson(doc, file);
+  file.close();
+  Serial.println("Credenciales guardadas correctamente");
 }
 
 void clearCredentials() {
-  prefs.clear();
-  Serial.println("✅ Credenciales borradas de NVS.");
+  SPIFFS.remove("/wifi.json");
+  Serial.println("Credenciales eliminadas del sistema de archivos");
 }
 
-bool hasSavedCredentials() {
-  return prefs.getString("ssid", "").length() > 0;
-}
-
-String getSavedSSID() { return prefs.getString("ssid", ""); }
-String getSavedPASS() { return prefs.getString("pass", ""); }
-
-void tryConnectSaved() {
-  String ssid = getSavedSSID();
-  String pass = getSavedPASS();
-  if (ssid.length() == 0) return;
+// ===================================================
+// CONEXIÓN AUTOMÁTICA A RED WIFI
+// ===================================================
+bool connectToWiFi() {
+  if (ssid == "" || password == "") return false;
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  Serial.print("Conectando a ");
-  Serial.print(ssid);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(ssid);
 
   unsigned long start = millis();
-  const unsigned long timeout = 15000; // 15s
-
-  while (millis() - start < timeout) {
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println();
-      Serial.print("✅ Conectado a ");
-      Serial.print(ssid);
-      Serial.print(" | IP: ");
-      Serial.println(WiFi.localIP());
-      startSTAWeb();
-      lastConnectAttempt = millis();
-      return;
-    }
-    Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(500);
+    Serial.print(".");
   }
 
-  Serial.println("\n❌ No se pudo conectar (timeout). Cambiando a modo AP...");
-  startAP();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Conectado a WiFi");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("\n❌ Falló la conexión a WiFi");
+    return false;
+  }
 }
